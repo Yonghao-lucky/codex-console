@@ -892,6 +892,10 @@ def _bootstrap_session_token_by_relogin(db, account: Account, proxy: Optional[st
     engine.email = email
     engine.password = password
     engine.email_info = {"service_id": account.email_service_id} if account.email_service_id else {}
+    logger.info(
+        "会话补全登录准备: account_id=%s email=%s password_len=%s email_service=%s",
+        account.id, email, len(password) if password else 0, account.email_service or "none",
+    )
 
     try:
         did, sen_token = engine._prepare_authorize_flow("会话补全登录")
@@ -932,20 +936,26 @@ def _bootstrap_session_token_by_relogin(db, account: Account, proxy: Optional[st
                     account.email,
                     password_result.error_message,
                 )
-                # 密码失败后重新走一次 OAuth，直接走 OTP 验证码（不提交密码）
+                # 密码失败后重新走 OAuth，用 screen_hint=signup 提交邮箱。
+                # 对已有账号，OpenAI 会直接返回 EMAIL_OTP_VERIFICATION 并自动发送验证码。
                 try:
                     did2, sen2 = engine._prepare_authorize_flow("会话补全登录(OTP回退)")
                     if not did2:
                         logger.warning("会话补全登录 OTP 回退: prepare_authorize_flow 失败: account_id=%s", account.id)
                         return ""
-                    login_start2 = engine._submit_login_start(did2, sen2)
-                    if not login_start2.success:
-                        logger.warning("会话补全登录 OTP 回退: login_start 失败: account_id=%s err=%s", account.id, login_start2.error_message)
+                    # 用 signup hint 提交邮箱，已有账号会直接进入 OTP 验证码页面
+                    signup_result = engine._submit_signup_start(did2, sen2, record_existing_account=False)
+                    if not signup_result.success:
+                        logger.warning("会话补全登录 OTP 回退: signup_start 失败: account_id=%s err=%s", account.id, signup_result.error_message)
                         return ""
-                    # 不管返回什么页面类型，都直接发送 OTP 验证码
-                    engine._log("OTP 回退: 直接请求发送验证码，跳过密码...")
-                    engine._send_verification_code(referer="https://auth.openai.com/log-in/password")
-                    # 继续走下面的 OTP 验证流程
+                    if signup_result.page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
+                        engine._log("OTP 回退: 已进入验证码页面，OpenAI 已自动发送验证码")
+                    elif signup_result.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
+                        # 仍然到密码页，说明这个账号必须走密码登录，OTP 回退不可用
+                        logger.warning("会话补全登录 OTP 回退: 仍然返回密码页，无法走 OTP: account_id=%s", account.id)
+                        return ""
+                    else:
+                        engine._log(f"OTP 回退: 返回页面类型 {signup_result.page_type}，继续尝试验证码流程")
                 except Exception as otp_fallback_exc:
                     logger.warning(
                         "会话补全登录 OTP 回退异常: account_id=%s email=%s err=%s",

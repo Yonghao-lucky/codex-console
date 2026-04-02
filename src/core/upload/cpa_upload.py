@@ -101,11 +101,35 @@ def generate_token_json(account: Account) -> dict:
     Returns:
         CPA 格式的 Token 字典
     """
+    import base64 as _b64
+    import json as _json
+
     extra_data = account.extra_data if isinstance(account.extra_data, dict) else {}
     subscription_type = str(account.subscription_type or "free").strip().lower() or "free"
     role_tag = str(getattr(account, "role_tag", "") or "").strip().lower() or "none"
-    workspace_id = str(account.workspace_id or account.account_id or "").strip()
-    account_id = workspace_id or str(account.account_id or "").strip()
+
+    # account_id 必须从 access_token JWT 里解析真实的 chatgpt_account_id，
+    # 不能用被 Team 收敛覆盖的 workspace_id，否则 CPA 会报"缺少 ChatGPT 账号 ID"。
+    jwt_account_id = ""
+    for token_field in (account.access_token, account.id_token):
+        raw = str(token_field or "").strip()
+        if raw.count(".") >= 2:
+            try:
+                payload_part = raw.split(".")[1]
+                padding = "=" * (-len(payload_part) % 4)
+                decoded = _b64.urlsafe_b64decode((payload_part + padding).encode("utf-8"))
+                claims = _json.loads(decoded.decode("utf-8"))
+                auth = claims.get("https://api.openai.com/auth") if isinstance(claims, dict) else None
+                if isinstance(auth, dict):
+                    cid = str(auth.get("chatgpt_account_id") or "").strip()
+                    if cid:
+                        jwt_account_id = cid
+                        break
+            except Exception:
+                pass
+
+    account_id = jwt_account_id or str(account.account_id or "").strip()
+    workspace_id = str(account.workspace_id or account_id or "").strip()
 
     return {
         "type": "codex",

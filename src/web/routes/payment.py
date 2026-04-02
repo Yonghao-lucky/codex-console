@@ -1957,22 +1957,12 @@ def _relogin_and_refresh_full_account_context(db, account: Account, proxy: Optio
     if not session_token:
         return False, "relogin_session_not_acquired"
 
-    reconcile_result = reconcile_account_runtime_state(account.id, proxy_url=proxy)
-    latest = crud.get_account_by_id(db, account.id)
-    if latest:
-        account.access_token = latest.access_token
-        account.refresh_token = latest.refresh_token
-        account.id_token = latest.id_token
-        account.session_token = latest.session_token
-        account.account_id = latest.account_id
-        account.workspace_id = latest.workspace_id
-        account.subscription_type = latest.subscription_type
-        account.extra_data = latest.extra_data
-        account.last_refresh = latest.last_refresh
-
-    runtime_plan = str((reconcile_result.get("detail") or {}).get("status") or reconcile_result.get("subscription_type") or "").strip().lower()
-    if runtime_plan in {"plus", "team", "free"}:
-        return True, None
+    # 重新登录后从数据库刷新账号，拿到最新的 token/workspace/subscription
+    # 注意：不再调 reconcile_account_runtime_state，因为那个函数会把 account_id
+    # 覆盖成母号的 Team workspace ID，导致 CPA 导出时 account_id 不对。
+    # 重新登录本身已经通过 OAuth callback 拿到了正确的 account_id/workspace_id。
+    db.expire(account)
+    db.refresh(account)
     return True, None
 
 
@@ -1992,17 +1982,29 @@ def _check_subscription_detail_with_retry(
     refreshed = False
 
     if allow_token_refresh:
-        ok, err = _relogin_and_refresh_full_account_context(db, account, proxy)
-        if ok:
-            db.commit()
-            db.refresh(account)
-            refreshed = True
+        password = str(getattr(account, "password", "") or "").strip()
+        email_service = str(getattr(account, "email_service", "") or "").strip()
+        can_relogin = bool(password and email_service)
+        if can_relogin:
+            ok, err = _relogin_and_refresh_full_account_context(db, account, proxy)
+            if ok:
+                db.commit()
+                db.refresh(account)
+                refreshed = True
+            else:
+                logger.warning(
+                    "订阅检测重新登录补完整资料失败: account_id=%s email=%s err=%s",
+                    account.id,
+                    account.email,
+                    err,
+                )
         else:
-            logger.warning(
-                "订阅检测重新登录补完整资料失败: account_id=%s email=%s err=%s",
+            logger.info(
+                "订阅检测跳过重新登录（无密码或无邮箱服务）: account_id=%s email=%s has_password=%s email_service=%s",
                 account.id,
                 account.email,
-                err,
+                bool(password),
+                email_service or "none",
             )
 
     try:
@@ -3453,9 +3455,6 @@ def batch_check_subscription(request: BatchCheckSubscriptionRequest):
 
             try:
                 runtime_proxy = _resolve_runtime_proxy(explicit_proxy, account)
-                reconcile_account_runtime_state(account.id, proxy_url=runtime_proxy)
-                db.expire(account)
-                db.refresh(account)
                 detail, refreshed = _check_subscription_detail_with_retry(
                     db=db,
                     account=account,

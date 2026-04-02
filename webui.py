@@ -7,6 +7,7 @@ import logging
 import socket
 import sys
 from pathlib import Path
+from datetime import datetime
 
 # 添加项目根目录到 Python 路径
 # PyInstaller 打包后 __file__ 在临时解压目录，需要用 sys.executable 所在目录作为数据目录
@@ -96,8 +97,11 @@ def setup_application():
     # 获取配置（需要数据库已初始化）
     settings = get_settings()
 
-    # 配置日志（日志文件写到实际 logs 目录）
-    log_file = str(logs_dir / Path(settings.log_file).name)
+    # 配置日志：每次启动写独立日志文件，便于回溯单次运行。
+    base_log_name = Path(settings.log_file).stem or "app"
+    log_suffix = Path(settings.log_file).suffix or ".log"
+    startup_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_file = str(logs_dir / f"{base_log_name}-{startup_stamp}{log_suffix}")
     setup_logging(
         log_level=settings.log_level,
         log_file=log_file
@@ -108,6 +112,7 @@ def setup_application():
     logger.info("数据库初始化完成，地基已经打好")
     logger.info(f"数据目录已安顿好: {data_dir}")
     logger.info(f"日志目录也已就位: {logs_dir}")
+    logger.info(f"本次启动日志文件: {log_file}")
 
     logger.info("应用程序设置完成，齿轮已经咔哒一声卡上了")
     return settings

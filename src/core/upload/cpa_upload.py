@@ -15,6 +15,7 @@ from ...database.session import get_db
 from ...database.models import Account
 from ...config.settings import get_settings
 from ..timezone_utils import utcnow_naive
+from ...web.services.accounts_service import reconcile_account_runtime_state
 
 logger = logging.getLogger(__name__)
 
@@ -100,15 +101,31 @@ def generate_token_json(account: Account) -> dict:
     Returns:
         CPA 格式的 Token 字典
     """
+    extra_data = account.extra_data if isinstance(account.extra_data, dict) else {}
+    subscription_type = str(account.subscription_type or "free").strip().lower() or "free"
+    role_tag = str(getattr(account, "role_tag", "") or "").strip().lower() or "none"
+    workspace_id = str(account.workspace_id or account.account_id or "").strip()
+    account_id = workspace_id or str(account.account_id or "").strip()
+
     return {
         "type": "codex",
         "email": account.email,
         "expired": account.expires_at.strftime("%Y-%m-%dT%H:%M:%S+08:00") if account.expires_at else "",
         "id_token": account.id_token or "",
-        "account_id": account.account_id or "",
+        "account_id": account_id,
+        "workspace_id": workspace_id,
         "access_token": account.access_token or "",
         "last_refresh": account.last_refresh.strftime("%Y-%m-%dT%H:%M:%S+08:00") if account.last_refresh else "",
         "refresh_token": account.refresh_token or "",
+        "subscription_type": subscription_type,
+        "plan_type": subscription_type,
+        "role_tag": role_tag,
+        "account_label": getattr(account, "account_label", None) or ("mother" if role_tag == "parent" else "child" if role_tag == "child" else "none"),
+        "team_role": extra_data.get("team_role") or extra_data.get("workspace_role") or "",
+        "auth_mode": extra_data.get("auth_mode") or "",
+        "runtime_token_plan": extra_data.get("runtime_token_plan") or "",
+        "runtime_id_plan": extra_data.get("runtime_id_plan") or "",
+        "disabled": False,
     }
 
 
@@ -230,6 +247,13 @@ def batch_upload_to_cpa(
                     "error": "缺少 Token"
                 })
                 continue
+
+            try:
+                reconcile_account_runtime_state(account.id)
+                db.expire(account)
+                db.refresh(account)
+            except Exception as exc:
+                logger.warning("CPA 批量上传前状态收敛失败: account_id=%s email=%s err=%s", account.id, account.email, exc)
 
             # 生成 Token JSON
             token_data = generate_token_json(account)

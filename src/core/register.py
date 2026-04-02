@@ -1591,6 +1591,10 @@ class RegistrationEngine:
             return False
 
         self._log("摸一下 Workspace ID，看看该坐哪桌...")
+        def _is_registration_gate(url: str) -> bool:
+            u = str(url or "").strip().lower()
+            return ("auth.openai.com/about-you" in u) or ("auth.openai.com/add-phone" in u)
+
         workspace_id = str(self._last_validate_otp_workspace_id or "").strip()
         if workspace_id:
             self._log(f"使用 OTP 返回的 Workspace ID: {workspace_id}")
@@ -1614,28 +1618,43 @@ class RegistrationEngine:
         if not continue_url:
             continue_url = str(self._last_validate_otp_continue_url or self._create_account_continue_url or "").strip()
             if continue_url:
-                self._log("使用缓存 continue_url 继续授权链路", "warning")
+                if _is_registration_gate(continue_url):
+                    self._log("缓存 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址", "warning")
+                    continue_url = ""
+                else:
+                    self._log("使用缓存 continue_url 继续授权链路", "warning")
 
         if not continue_url:
-            result.error_message = "获取 Workspace ID 失败"
-            return False
+            self._log("未拿到可用 continue_url，改走原生轻量 token 抓取兜底...", "warning")
+            if self._capture_native_core_tokens(result):
+                return True
+            self._log("原生轻量 token 抓取未命中，尝试严格补会话...", "warning")
+            if result.access_token and self._ensure_session_token_strict(result):
+                return True
 
-        self._log("顺着重定向面包屑往前走，别跟丢了...")
-        callback_url, _final_url = self._follow_redirects(continue_url)
-        if not callback_url:
-            result.error_message = "跟随重定向链失败"
-            return False
+        if continue_url:
+            self._log("顺着重定向面包屑往前走，别跟丢了...")
+            callback_url, _final_url = self._follow_redirects(continue_url)
+            if not callback_url:
+                self._log("缓存 continue_url 未拿到 callback，改走原生轻量 token 抓取兜底...", "warning")
+                if self._capture_native_core_tokens(result):
+                    return True
+                result.error_message = "跟随重定向链失败"
+                return False
 
-        self._log("处理 OAuth 回调，准备把 token 请出来...")
-        token_info = self._handle_oauth_callback(callback_url)
-        if not token_info:
-            result.error_message = "处理 OAuth 回调失败"
-            return False
+            self._log("处理 OAuth 回调，准备把 token 请出来...")
+            token_info = self._handle_oauth_callback(callback_url)
+            if not token_info:
+                self._log("OAuth 回调未拿到 token，改走原生轻量 token 抓取兜底...", "warning")
+                if self._capture_native_core_tokens(result):
+                    return True
+                result.error_message = "处理 OAuth 回调失败"
+                return False
 
-        result.account_id = str(token_info.get("account_id") or result.account_id or "").strip()
-        result.access_token = str(token_info.get("access_token") or result.access_token or "").strip()
-        result.refresh_token = str(token_info.get("refresh_token") or result.refresh_token or "").strip()
-        result.id_token = str(token_info.get("id_token") or result.id_token or "").strip()
+            result.account_id = str(token_info.get("account_id") or result.account_id or "").strip()
+            result.access_token = str(token_info.get("access_token") or result.access_token or "").strip()
+            result.refresh_token = str(token_info.get("refresh_token") or result.refresh_token or "").strip()
+            result.id_token = str(token_info.get("id_token") or result.id_token or "").strip()
         result.password = self.password or ""
         result.source = "login" if self._is_existing_account else "register"
         result.device_id = result.device_id or str(self.device_id or "")

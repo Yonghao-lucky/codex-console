@@ -883,6 +883,7 @@ function buildBatchPayload(extraFields = {}) {
     const filterPayload = filterProtocol.toPayload({
         status_filter: currentFilters.status,
         email_service_filter: currentFilters.email_service,
+        role_tag_filter: currentFilters.role_tag,
         search_filter: currentFilters.search,
     });
     if (selectAllPages) {
@@ -1068,14 +1069,55 @@ async function refreshToken(id) {
         });
 
         if (result.success) {
-            toast.success('Token刷新成功');
+            toast.success(formatRefreshResultMessage(result));
             loadAccounts();
         } else {
-            toast.error('刷新失败: ' + (result.error || '未知错误'));
+            toast.error(formatRefreshFailureMessage(result));
         }
     } catch (error) {
         toast.error('刷新失败: ' + error.message);
     }
+}
+
+function formatRefreshResultMessage(result) {
+    const parts = [];
+    parts.push('普通刷新成功');
+
+    const reconciled = result?.reconciled || null;
+    if (reconciled) {
+        const subscriptionType = String(reconciled.subscription_type || '').trim().toLowerCase();
+        const workspaceId = String(reconciled.workspace_id || '').trim();
+        if (subscriptionType) {
+            parts.push(`订阅状态: ${subscriptionType}`);
+        }
+        if (workspaceId) {
+            parts.push('工作区已同步');
+        }
+        if (reconciled.token_refreshed) {
+            parts.push('Token 已更新');
+        }
+    }
+
+    return parts.join('，');
+}
+
+function formatRefreshFailureMessage(result) {
+    const parts = ['刷新失败'];
+    if (result?.error) {
+        parts.push(String(result.error));
+    }
+    const reconciled = result?.reconciled || null;
+    if (reconciled?.subscription_type) {
+        parts.push(`当前订阅: ${String(reconciled.subscription_type)}`);
+    }
+    return parts.join(': ');
+}
+
+function formatBatchRefreshSummary(result) {
+    const successCount = Number(result?.success_count || 0);
+    const failedCount = Number(result?.failed_count || 0);
+    const parts = [`成功刷新 ${successCount} 个`, `失败 ${failedCount} 个`];
+    return parts.join('，');
 }
 
 async function validateToken(id) {
@@ -1158,7 +1200,7 @@ async function runBatchRefreshTask(payload, count, sourceLabel, options = {}) {
         const status = String(finalTask?.status || '').toLowerCase();
         if (status === 'completed') {
             if (showToast) {
-                toast.success(`成功刷新 ${result.success_count || 0} 个，失败 ${result.failed_count || 0} 个`);
+                toast.success(formatBatchRefreshSummary(result));
             }
         } else if (status === 'cancelled') {
             if (showToast) {
@@ -1204,6 +1246,7 @@ function buildQuickRefreshPayload() {
         ...filterProtocol.toPayload({
             status_filter: currentFilters.status,
             email_service_filter: currentFilters.email_service,
+            role_tag_filter: currentFilters.role_tag,
             search_filter: currentFilters.search,
         }),
     };

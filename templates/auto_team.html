@@ -1122,6 +1122,11 @@
 
                 <div id="teamImportSinglePanel" class="team-import-panel active">
                     <div class="form-group">
+                        <label for="teamImportAuthJson">认证文件 JSON</label>
+                        <textarea id="teamImportAuthJson" class="form-input team-import-batch-input" placeholder='可直接粘贴认证文件 JSON，例如 {"access_token":"...","refresh_token":"...","id_token":"...","account_id":"...","email":"..."}'></textarea>
+                        <div class="team-import-hint">如果你已有完整认证文件，优先粘贴这里，系统会自动补齐母号字段。</div>
+                    </div>
+                    <div class="form-group">
                         <label for="teamImportAccessToken">Access Token (AT) *</label>
                         <input id="teamImportAccessToken" class="form-input" type="text" placeholder="eyJ...">
                         <div class="team-import-hint">必填项，以 eyJ 开头的 JWT Token</div>
@@ -1176,7 +1181,6 @@
     {% include "partials/site_footer.html" %}
 </body>
 </html>
-
 
 
 

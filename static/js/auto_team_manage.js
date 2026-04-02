@@ -137,6 +137,18 @@
         return { email, accountId, clientId, plan };
     }
 
+    function extractIdTokenFields(idToken) {
+        const payload = decodeJwtPayload(idToken);
+        const auth = payload['https://api.openai.com/auth'] || {};
+        const email = String(payload.email || '').trim().toLowerCase();
+        const accountId = String(auth.chatgpt_account_id || '').trim();
+        const planRaw = String(auth.chatgpt_plan_type || '').trim().toLowerCase();
+        const organizations = Array.isArray(auth.organizations) ? auth.organizations : [];
+        const defaultOrg = organizations.find((item) => item && item.is_default) || organizations[0] || null;
+        const role = String(defaultOrg?.role || '').trim().toLowerCase();
+        return { email, accountId, plan: planRaw, role };
+    }
+
     class TeamManageConsole {
         constructor() {
             this.els = {
@@ -159,6 +171,7 @@
                 teamImportSinglePanel: document.getElementById('teamImportSinglePanel'),
                 teamImportBatchPanel: document.getElementById('teamImportBatchPanel'),
                 teamImportModalHint: document.getElementById('teamImportModalHint'),
+                teamImportAuthJson: document.getElementById('teamImportAuthJson'),
                 teamImportAccessToken: document.getElementById('teamImportAccessToken'),
                 teamImportRefreshToken: document.getElementById('teamImportRefreshToken'),
                 teamImportSessionToken: document.getElementById('teamImportSessionToken'),
@@ -807,7 +820,7 @@
 
         openImportModal() {
             this.setImportMode('single');
-            this.setImportHint('填写 Team Token 后点击导入。');
+            this.setImportHint('优先粘贴认证文件 JSON；系统会自动补齐 Team 母号字段。');
             this.els.teamImportModal?.classList.add('show');
         }
 
@@ -818,15 +831,18 @@
         buildImportItemFromRaw(rawItem) {
             const accessToken = String(rawItem.access_token || rawItem.accessToken || '').trim();
             const refreshToken = String(rawItem.refresh_token || rawItem.refreshToken || '').trim();
+            const idToken = String(rawItem.id_token || rawItem.idToken || '').trim();
             const sessionToken = String(rawItem.session_token || rawItem.sessionToken || '').trim();
             const clientIdInput = String(rawItem.client_id || rawItem.clientId || '').trim();
             const emailInput = String(rawItem.email || '').trim().toLowerCase();
             const accountIdInput = String(rawItem.account_id || rawItem.accountId || '').trim();
             const tokenFields = extractTokenFields(accessToken);
-            const email = emailInput || tokenFields.email;
-            const accountId = accountIdInput || tokenFields.accountId;
+            const idTokenFields = extractIdTokenFields(idToken);
+            const email = emailInput || tokenFields.email || idTokenFields.email;
+            const accountId = accountIdInput || tokenFields.accountId || idTokenFields.accountId;
             const clientId = clientIdInput || tokenFields.clientId;
-            const plan = String(tokenFields.plan || '').toLowerCase();
+            const plan = String(tokenFields.plan || idTokenFields.plan || '').toLowerCase();
+            const role = String(rawItem.role || idTokenFields.role || '').toLowerCase();
 
             if (!accessToken) {
                 throw new Error('缺少 access_token');
@@ -845,14 +861,17 @@
                 workspace_id: accountId || null,
                 access_token: accessToken,
                 refresh_token: refreshToken || null,
+                id_token: idToken || null,
                 session_token: sessionToken || null,
                 source: 'team_import',
                 role_tag: 'parent',
                 account_label: 'mother',
                 subscription_type: (plan === 'plus' || plan === 'team') ? plan : 'team',
+                pool_state: 'team_pool',
                 metadata: {
                     imported_from: 'team_manage_modal',
                     imported_at: new Date().toISOString(),
+                    team_role: role || null,
                 },
             };
         }
@@ -885,13 +904,24 @@
                 let rawItems = [];
 
                 if (this.teamImportMode === 'single') {
+                    let authJson = {};
+                    const authJsonText = String(this.els.teamImportAuthJson?.value || '').trim();
+                    if (authJsonText) {
+                        try {
+                            authJson = JSON.parse(authJsonText);
+                        } catch (_e) {
+                            throw new Error('认证文件 JSON 解析失败');
+                        }
+                    }
                     rawItems = [{
-                        access_token: this.els.teamImportAccessToken?.value,
-                        refresh_token: this.els.teamImportRefreshToken?.value,
-                        session_token: this.els.teamImportSessionToken?.value,
-                        client_id: this.els.teamImportClientId?.value,
-                        email: this.els.teamImportEmail?.value,
-                        account_id: this.els.teamImportAccountId?.value,
+                        ...authJson,
+                        access_token: this.els.teamImportAccessToken?.value || authJson.access_token,
+                        refresh_token: this.els.teamImportRefreshToken?.value || authJson.refresh_token,
+                        id_token: authJson.id_token,
+                        session_token: this.els.teamImportSessionToken?.value || authJson.session_token,
+                        client_id: this.els.teamImportClientId?.value || authJson.client_id,
+                        email: this.els.teamImportEmail?.value || authJson.email,
+                        account_id: this.els.teamImportAccountId?.value || authJson.account_id,
                     }];
                 } else {
                     rawItems = this.parseBatchImportText(this.els.teamImportBatchText?.value || '');
@@ -912,6 +942,7 @@
                 const msg = `完成：创建 ${data.created || 0}，更新 ${data.updated || 0}，跳过 ${data.skipped || 0}，失败 ${data.failed || 0}`;
                 this.setImportHint(msg, false);
                 toast.success('导入完成');
+                await api.post('/auto-team/pool/rebuild', {});
                 await this.loadConsole(false);
                 if (!Number(data.failed || 0)) {
                     this.closeImportModal();

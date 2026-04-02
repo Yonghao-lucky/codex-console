@@ -11,7 +11,7 @@ from datetime import datetime
 import time
 from urllib.parse import urlparse, urlunparse
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.orm import joinedload
@@ -22,7 +22,7 @@ from ...database.models import Account, BindCardTask, EmailService as EmailServi
 from ...config.settings import get_settings
 from ...config.constants import OPENAI_PAGE_TYPES
 from ...services import EmailServiceFactory, EmailServiceType
-from ...core.register import RegistrationEngine
+from ...core.register import RegistrationEngine, RegistrationResult
 from .accounts import resolve_account_ids
 from ...core.openai.payment import (
     generate_plus_checkout_bundle,
@@ -36,6 +36,8 @@ from ...core.openai.browser_bind import auto_bind_checkout_with_playwright
 from ...core.openai.random_billing import generate_random_billing_profile
 from ...core.openai.token_refresh import TokenRefreshManager
 from ...core.dynamic_proxy import get_proxy_url_for_task
+from ..services.accounts_service import reconcile_account_runtime_state
+from ..task_manager import task_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -86,6 +88,21 @@ def _is_retryable_subscription_check_error(error_message: Optional[str]) -> bool
         "rate limit",
     )
     return any(marker in text for marker in retry_markers)
+
+
+def _classify_subscription_check_error(error_message: Optional[str]) -> str:
+    text = str(error_message or "").strip().lower()
+    if not text:
+        return "unknown"
+    if "not found" in text or "http 404" in text:
+        return "not_found"
+    if "workspace" in text:
+        return "workspace_context_error"
+    if "token" in text or "401" in text or "403" in text or "unauthorized" in text:
+        return "token_invalid"
+    if _is_retryable_subscription_check_error(text):
+        return "network_error"
+    return "subscription_check_error"
 
 CHECKOUT_COUNTRY_CURRENCY_MAP = {
     "US": "USD",
@@ -936,6 +953,113 @@ def _bootstrap_session_token_by_relogin(db, account: Account, proxy: Optional[st
             )
             return ""
 
+        workspace_id = ""
+        try:
+            current_access_token = str(account.access_token or "").strip()
+            if current_access_token:
+                from ..services.accounts_service import _fetch_team_workspace_candidates
+                candidates = _fetch_team_workspace_candidates(current_access_token, proxy)
+                if candidates:
+                    workspace_id = str(candidates[0].get("account_id") or "").strip()
+                    if workspace_id:
+                        engine._log(f"会话补全登录: 优先使用 Team 候选 Workspace ID: {workspace_id}")
+        except Exception as exc:
+            logger.warning("会话补全登录获取 Team workspace candidates 失败: account_id=%s email=%s err=%s", account.id, account.email, exc)
+
+        if not workspace_id:
+            workspace_id = str(getattr(engine, "_last_validate_otp_workspace_id", "") or "").strip()
+        if not workspace_id:
+            try:
+                workspace_id = str(engine._get_workspace_id() or "").strip()
+            except Exception:
+                workspace_id = ""
+
+        continue_url = ""
+        if workspace_id:
+            engine._log("会话补全登录: 选择 Workspace，安排个靠谱座位...")
+            try:
+                continue_url = str(engine._select_workspace(workspace_id) or "").strip()
+            except Exception:
+                continue_url = ""
+
+        if not continue_url:
+            continue_url = str(getattr(engine, "_last_validate_otp_continue_url", "") or getattr(engine, "_create_account_continue_url", "") or "").strip()
+            if continue_url:
+                engine._log("会话补全登录: 使用缓存 continue_url 继续授权链路", "warning")
+
+        if continue_url:
+            try:
+                callback_url, _final_url = engine._follow_redirects(continue_url)
+            except Exception as exc:
+                logger.warning("会话补全登录跟随重定向失败: account_id=%s email=%s err=%s", account.id, account.email, exc)
+                callback_url = None
+
+            if callback_url:
+                try:
+                    token_info = engine._handle_oauth_callback(callback_url)
+                except Exception as exc:
+                    logger.warning("会话补全登录处理 OAuth 回调失败: account_id=%s email=%s err=%s", account.id, account.email, exc)
+                    token_info = None
+                if token_info:
+                    new_account_id = str(token_info.get("account_id") or "").strip()
+                    new_access_token = str(token_info.get("access_token") or "").strip()
+                    new_refresh_token = str(token_info.get("refresh_token") or "").strip()
+                    new_id_token = str(token_info.get("id_token") or "").strip()
+                    if new_account_id:
+                        account.account_id = new_account_id
+                        account.workspace_id = new_account_id
+                    elif workspace_id:
+                        account.workspace_id = workspace_id
+                        account.account_id = workspace_id
+                    if new_access_token:
+                        account.access_token = new_access_token
+                    if new_refresh_token:
+                        account.refresh_token = new_refresh_token
+                    if new_id_token:
+                        account.id_token = new_id_token
+
+                    try:
+                        capture_result = RegistrationResult(
+                            success=True,
+                            email=account.email,
+                            password=password,
+                            account_id=account.account_id or workspace_id,
+                            workspace_id=account.workspace_id or workspace_id,
+                            access_token=account.access_token or new_access_token,
+                            refresh_token=account.refresh_token or new_refresh_token,
+                            id_token=account.id_token or new_id_token,
+                            session_token=str(account.session_token or "").strip(),
+                            logs=[],
+                            metadata={},
+                            source="login",
+                        )
+                        captured = engine._capture_auth_session_tokens(capture_result, access_hint=capture_result.access_token)
+                        if captured:
+                            if str(capture_result.access_token or "").strip():
+                                account.access_token = str(capture_result.access_token or "").strip()
+                            if str(capture_result.session_token or "").strip():
+                                account.session_token = str(capture_result.session_token or "").strip()
+                            logger.info(
+                                "会话补全登录已基于 Team 工作区重新抓取 auth/session token: account_id=%s email=%s access_plan_hint=%s",
+                                account.id,
+                                account.email,
+                                "team" if "\"chatgpt_plan_type\":\"team\"" in str(capture_result.id_token or "") else "unknown",
+                            )
+                    except Exception as capture_exc:
+                        logger.warning(
+                            "会话补全登录 Team auth/session 二次抓取失败: account_id=%s email=%s err=%s",
+                            account.id,
+                            account.email,
+                            capture_exc,
+                        )
+
+                    logger.info(
+                        "会话补全登录已完成 Team 工作区 OAuth 换票: account_id=%s email=%s new_account_id=%s",
+                        account.id,
+                        account.email,
+                        account.account_id,
+                    )
+
         fresh_cookies = engine._dump_session_cookies()
         # 兜底拼装关键 cookie，避免个别环境 cookie jar 导出不全。
         try:
@@ -981,6 +1105,8 @@ def _bootstrap_session_token_by_relogin(db, account: Account, proxy: Optional[st
         if fresh_cookies:
             account.cookies = fresh_cookies
         account.session_token = session_token
+        if workspace_id and not str(account.workspace_id or "").strip():
+            account.workspace_id = workspace_id
         account.last_refresh = utcnow_naive()
         db.commit()
         db.refresh(account)
@@ -1822,6 +1948,34 @@ def _refresh_account_token_for_subscription_check(account: Account, proxy: Optio
     return True, None
 
 
+def _relogin_and_refresh_full_account_context(db, account: Account, proxy: Optional[str]) -> tuple[bool, Optional[str]]:
+    """
+    订阅检测专用：重新登录并获取完整最新资料。
+    目标是覆盖旧的 access_token / id_token / session_token / account_id / workspace_id。
+    """
+    session_token = _bootstrap_session_token_by_relogin(db, account, proxy)
+    if not session_token:
+        return False, "relogin_session_not_acquired"
+
+    reconcile_result = reconcile_account_runtime_state(account.id, proxy_url=proxy)
+    latest = crud.get_account_by_id(db, account.id)
+    if latest:
+        account.access_token = latest.access_token
+        account.refresh_token = latest.refresh_token
+        account.id_token = latest.id_token
+        account.session_token = latest.session_token
+        account.account_id = latest.account_id
+        account.workspace_id = latest.workspace_id
+        account.subscription_type = latest.subscription_type
+        account.extra_data = latest.extra_data
+        account.last_refresh = latest.last_refresh
+
+    runtime_plan = str((reconcile_result.get("detail") or {}).get("status") or reconcile_result.get("subscription_type") or "").strip().lower()
+    if runtime_plan in {"plus", "team", "free"}:
+        return True, None
+    return True, None
+
+
 def _check_subscription_detail_with_retry(
     db,
     account: Account,
@@ -1836,6 +1990,20 @@ def _check_subscription_detail_with_retry(
         (detail, refreshed)
     """
     refreshed = False
+
+    if allow_token_refresh:
+        ok, err = _relogin_and_refresh_full_account_context(db, account, proxy)
+        if ok:
+            db.commit()
+            db.refresh(account)
+            refreshed = True
+        else:
+            logger.warning(
+                "订阅检测重新登录补完整资料失败: account_id=%s email=%s err=%s",
+                account.id,
+                account.email,
+                err,
+            )
 
     try:
         detail = check_subscription_status_detail(account, proxy)
@@ -2064,6 +2232,7 @@ class BatchCheckSubscriptionRequest(BaseModel):
     select_all: bool = False
     status_filter: Optional[str] = None
     email_service_filter: Optional[str] = None
+    role_tag_filter: Optional[str] = None
     search_filter: Optional[str] = None
 
 
@@ -3271,7 +3440,7 @@ def batch_check_subscription(request: BatchCheckSubscriptionRequest):
     with get_db() as db:
         ids = resolve_account_ids(
             db, request.ids, request.select_all,
-            request.status_filter, request.email_service_filter, request.search_filter
+            request.status_filter, request.email_service_filter, request.role_tag_filter, request.search_filter
         )
         for account_id in ids:
             account = db.query(Account).filter(Account.id == account_id).first()
@@ -3284,6 +3453,9 @@ def batch_check_subscription(request: BatchCheckSubscriptionRequest):
 
             try:
                 runtime_proxy = _resolve_runtime_proxy(explicit_proxy, account)
+                reconcile_account_runtime_state(account.id, proxy_url=runtime_proxy)
+                db.expire(account)
+                db.refresh(account)
                 detail, refreshed = _check_subscription_detail_with_retry(
                     db=db,
                     account=account,
@@ -3316,10 +3488,127 @@ def batch_check_subscription(request: BatchCheckSubscriptionRequest):
             except Exception as e:
                 results["failed_count"] += 1
                 results["details"].append(
-                    {"id": account_id, "email": account.email, "success": False, "error": str(e)}
+                    {
+                        "id": account_id,
+                        "email": account.email,
+                        "success": False,
+                        "error": str(e),
+                        "error_type": _classify_subscription_check_error(str(e)),
+                    }
                 )
 
     return results
+
+
+def _run_payment_domain_task(task_id: str, runner, request_obj, total: int) -> None:
+    domain = "payment"
+    acquired = False
+    try:
+        while True:
+            if task_manager.is_domain_task_cancel_requested(domain, task_id):
+                task_manager.update_domain_task(
+                    domain,
+                    task_id,
+                    status="cancelled",
+                    message="任务已取消",
+                    finished_at=utcnow_naive().isoformat(),
+                )
+                return
+            acquired, running, quota = task_manager.try_acquire_domain_slot(domain, task_id)
+            if acquired:
+                break
+            task_manager.update_domain_task(
+                domain,
+                task_id,
+                status="pending",
+                message=f"等待可用执行槽位 ({running}/{quota})",
+            )
+            time.sleep(0.5)
+
+        task_manager.update_domain_task(
+            domain,
+            task_id,
+            status="running",
+            message="任务执行中",
+            progress={"completed": 0, "total": int(total or 0)},
+        )
+        result = runner(request_obj)
+        completed = int((result.get("success_count") or 0) + (result.get("failed_count") or 0))
+        task_manager.update_domain_task(
+            domain,
+            task_id,
+            status="completed",
+            message="任务执行完成",
+            finished_at=utcnow_naive().isoformat(),
+            progress={"completed": completed or int(total or 0), "total": int(total or completed or 0)},
+            result=result,
+        )
+    except Exception as exc:
+        task_manager.update_domain_task(
+            domain,
+            task_id,
+            status="failed",
+            message=str(exc),
+            finished_at=utcnow_naive().isoformat(),
+            error=str(exc),
+        )
+    finally:
+        if acquired:
+            task_manager.release_domain_slot(domain, task_id)
+
+
+@router.post("/accounts/batch-check-subscription/async")
+async def batch_check_subscription_async(request: BatchCheckSubscriptionRequest, background_tasks: BackgroundTasks):
+    total = len(request.ids or []) if not request.select_all else max(1, len(request.ids or []))
+    task_id = str(uuid.uuid4())
+    task = task_manager.register_domain_task(
+        domain="payment",
+        task_id=task_id,
+        task_type="batch_check_subscription",
+        payload={"select_all": bool(request.select_all)},
+        progress={"completed": 0, "total": int(total or 0)},
+    )
+    background_tasks.add_task(_run_payment_domain_task, task_id, batch_check_subscription, request, total)
+    return task
+
+
+@router.get("/tasks/{task_id}")
+def get_payment_op_task(task_id: str):
+    task = task_manager.get_domain_task("payment", task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return task
+
+
+@router.post("/tasks/{task_id}/cancel")
+def cancel_payment_op_task(task_id: str):
+    snapshot = task_manager.request_domain_task_cancel("payment", task_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"success": True, "task": snapshot}
+
+
+@router.post("/tasks/{task_id}/pause")
+def pause_payment_op_task(task_id: str):
+    snapshot = task_manager.request_domain_task_pause("payment", task_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"success": True, "task": snapshot}
+
+
+@router.post("/tasks/{task_id}/resume")
+def resume_payment_op_task(task_id: str):
+    snapshot = task_manager.request_domain_task_resume("payment", task_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"success": True, "task": snapshot}
+
+
+def retry_payment_op_task(task_id: str):
+    snapshot = task_manager.request_domain_task_retry("payment", task_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return snapshot
 
 
 @router.post("/accounts/{account_id}/mark-subscription")

@@ -11,6 +11,7 @@ from typing import List, Optional, Dict, Tuple, Any
 
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func
 
 from ...config.constants import (
     RoleTag,
@@ -19,7 +20,7 @@ from ...config.constants import (
 )
 from ...database import crud
 from ...database.session import get_db
-from ...database.models import RegistrationTask, ScheduledRegistrationJob, Proxy
+from ...database.models import RegistrationTask, ScheduledRegistrationJob, Proxy, Account as AccountModel
 from ...core.register import RegistrationEngine, RegistrationResult
 from ...services import EmailServiceFactory, EmailServiceType
 from ...config.settings import get_settings, Settings
@@ -32,6 +33,7 @@ from ...core.auto_registration import (
 )
 from ...core.timezone_utils import utcnow_naive
 from ..task_manager import task_manager
+from ..services.accounts_service import reconcile_account_runtime_state
 from ..schedule_utils import normalize_schedule_config, compute_next_run_at, describe_schedule
 
 logger = logging.getLogger(__name__)
@@ -41,6 +43,34 @@ router = APIRouter()
 running_tasks: dict = {}
 # 批量任务存储
 batch_tasks: Dict[str, dict] = {}
+
+
+def _normalize_email_lookup_value(email: Optional[str]) -> str:
+    return str(email or "").strip().lower()
+
+
+def _find_registered_account_by_email(db, email: Optional[str]):
+    normalized_email = _normalize_email_lookup_value(email)
+    if not normalized_email:
+        return None
+    from ...database.models import Account
+
+    return (
+        db.query(Account)
+        .filter(func.lower(Account.email) == normalized_email)
+        .first()
+    )
+
+
+def _get_saved_account_by_email(db, email: Optional[str]):
+    normalized_email = _normalize_email_lookup_value(email)
+    if not normalized_email:
+        return None
+    return (
+        db.query(AccountModel)
+        .filter(func.lower(AccountModel.email) == normalized_email)
+        .first()
+    )
 
 
 def _cancel_batch_tasks(batch_id: str) -> None:
@@ -458,11 +488,11 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     # 找到一个未注册的 Outlook 账户
                     selected_service = None
                     for svc in outlook_services:
-                        email = svc.config.get("email") if svc.config else None
+                        email = (svc.config or {}).get("email") if svc.config else None
                         if not email:
                             continue
                         # 检查是否已在 accounts 表中注册
-                        existing = db.query(Account).filter(Account.email == email).first()
+                        existing = _find_registered_account_by_email(db, email)
                         if not existing:
                             selected_service = svc
                             logger.info(f"选择未注册的 Outlook 账户: {email}")
@@ -611,6 +641,28 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 # 保存到数据库
                 engine.save_to_database(result, account_label=account_label, role_tag=role_tag)
 
+                saved_account = _get_saved_account_by_email(db, result.email)
+                if saved_account:
+                    try:
+                        reconcile_summary = reconcile_account_runtime_state(
+                            saved_account.id,
+                            proxy_url=actual_proxy_url,
+                            desired_role_tag=role_tag,
+                            allow_team_inference=False,
+                            refresh_subscription=False,
+                        )
+                        log_callback(
+                            "[状态收敛] role=%s subscription=%s workspace=%s refreshed=%s"
+                            % (
+                                reconcile_summary.get("role_tag") or "none",
+                                reconcile_summary.get("subscription_type") or "free",
+                                reconcile_summary.get("workspace_id") or "-",
+                                bool(reconcile_summary.get("token_refreshed")),
+                            )
+                        )
+                    except Exception as reconcile_err:
+                        log_callback(f"[状态收敛] 失败: {reconcile_err}")
+
                 if callable(marker) and result.email:
                     try:
                         marker(
@@ -621,117 +673,113 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     except Exception as mark_err:
                         logger.warning(f"记录邮箱成功状态失败: {mark_err}")
 
-                # 自动上传到 CPA（可多服务）
-                if auto_upload_cpa:
-                    try:
-                        from ...core.upload.cpa_upload import upload_to_cpa, generate_token_json
-                        from ...database.models import Account as AccountModel
-                        saved_account = db.query(AccountModel).filter_by(email=result.email).first()
-                        if saved_account and saved_account.access_token:
-                            token_data = generate_token_json(saved_account)
-                            _cpa_ids = cpa_service_ids or []
-                            if not _cpa_ids:
-                                # 未指定则取所有启用的服务
-                                _cpa_ids = [s.id for s in crud.get_cpa_services(db, enabled=True)]
-                            if not _cpa_ids:
-                                log_callback("[CPA] 无可用 CPA 服务，跳过上传")
-                            for _sid in _cpa_ids:
-                                try:
-                                    _svc = crud.get_cpa_service_by_id(db, _sid)
-                                    if not _svc:
-                                        continue
-                                    log_callback(f"[CPA] 正在把账号打包发往服务站: {_svc.name}")
-                                    _ok, _msg = upload_to_cpa(token_data, api_url=_svc.api_url, api_token=_svc.api_token)
-                                    if _ok:
-                                        saved_account.cpa_uploaded = True
-                                        saved_account.cpa_uploaded_at = utcnow_naive()
-                                        db.commit()
-                                        log_callback(f"[CPA] 投递成功，服务站已签收: {_svc.name}")
-                                    else:
-                                        log_callback(f"[CPA] 上传失败({_svc.name}): {_msg}")
-                                except Exception as _e:
-                                    log_callback(f"[CPA] 异常({_sid}): {_e}")
-                    except Exception as cpa_err:
-                        log_callback(f"[CPA] 上传异常: {cpa_err}")
+                try:
+                    # 自动上传到 CPA（可多服务）
+                    if auto_upload_cpa:
+                        try:
+                            from ...core.upload.cpa_upload import upload_to_cpa, generate_token_json
+                            saved_account = _get_saved_account_by_email(db, result.email)
+                            if saved_account and saved_account.access_token:
+                                token_data = generate_token_json(saved_account)
+                                _cpa_ids = cpa_service_ids or []
+                                if not _cpa_ids:
+                                    _cpa_ids = [s.id for s in crud.get_cpa_services(db, enabled=True)]
+                                if not _cpa_ids:
+                                    log_callback("[CPA] 无可用 CPA 服务，跳过上传")
+                                for _sid in _cpa_ids:
+                                    try:
+                                        _svc = crud.get_cpa_service_by_id(db, _sid)
+                                        if not _svc:
+                                            continue
+                                        log_callback(f"[CPA] 正在把账号打包发往服务站: {_svc.name}")
+                                        _ok, _msg = upload_to_cpa(token_data, api_url=_svc.api_url, api_token=_svc.api_token)
+                                        if _ok:
+                                            saved_account.cpa_uploaded = True
+                                            saved_account.cpa_uploaded_at = utcnow_naive()
+                                            db.commit()
+                                            log_callback(f"[CPA] 投递成功，服务站已签收: {_svc.name}")
+                                        else:
+                                            log_callback(f"[CPA] 上传失败({_svc.name}): {_msg}")
+                                    except Exception as _e:
+                                        log_callback(f"[CPA] 异常({_sid}): {_e}")
+                        except Exception as cpa_err:
+                            log_callback(f"[CPA] 上传异常: {cpa_err}")
 
-                # 自动上传到 Sub2API（可多服务）
-                if auto_upload_sub2api:
-                    try:
-                        from ...core.upload.sub2api_upload import upload_to_sub2api
-                        from ...database.models import Account as AccountModel
-                        saved_account = db.query(AccountModel).filter_by(email=result.email).first()
-                        if saved_account and saved_account.access_token:
-                            _s2a_ids = sub2api_service_ids or []
-                            if not _s2a_ids:
-                                _s2a_ids = [s.id for s in crud.get_sub2api_services(db, enabled=True)]
-                            if not _s2a_ids:
-                                log_callback("[Sub2API] 无可用 Sub2API 服务，跳过上传")
-                            for _sid in _s2a_ids:
-                                try:
-                                    _svc = crud.get_sub2api_service_by_id(db, _sid)
-                                    if not _svc:
-                                        continue
-                                    log_callback(f"[Sub2API] 正在把账号发往服务站: {_svc.name}")
-                                    _ok, _msg = upload_to_sub2api([saved_account], _svc.api_url, _svc.api_key)
-                                    log_callback(f"[Sub2API] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
-                                except Exception as _e:
-                                    log_callback(f"[Sub2API] 异常({_sid}): {_e}")
-                    except Exception as s2a_err:
-                        log_callback(f"[Sub2API] 上传异常: {s2a_err}")
+                    if auto_upload_sub2api:
+                        try:
+                            from ...core.upload.sub2api_upload import upload_to_sub2api
+                            saved_account = _get_saved_account_by_email(db, result.email)
+                            if saved_account and saved_account.access_token:
+                                _s2a_ids = sub2api_service_ids or []
+                                if not _s2a_ids:
+                                    _s2a_ids = [s.id for s in crud.get_sub2api_services(db, enabled=True)]
+                                if not _s2a_ids:
+                                    log_callback("[Sub2API] 无可用 Sub2API 服务，跳过上传")
+                                for _sid in _s2a_ids:
+                                    try:
+                                        _svc = crud.get_sub2api_service_by_id(db, _sid)
+                                        if not _svc:
+                                            continue
+                                        log_callback(f"[Sub2API] 正在把账号发往服务站: {_svc.name}")
+                                        _ok, _msg = upload_to_sub2api([saved_account], _svc.api_url, _svc.api_key)
+                                        log_callback(f"[Sub2API] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
+                                    except Exception as _e:
+                                        log_callback(f"[Sub2API] 异常({_sid}): {_e}")
+                        except Exception as s2a_err:
+                            log_callback(f"[Sub2API] 上传异常: {s2a_err}")
 
-                # 自动上传到 Team Manager（可多服务）
-                if auto_upload_tm:
-                    try:
-                        from ...core.upload.team_manager_upload import upload_to_team_manager
-                        from ...database.models import Account as AccountModel
-                        saved_account = db.query(AccountModel).filter_by(email=result.email).first()
-                        if saved_account and saved_account.access_token:
-                            _tm_ids = tm_service_ids or []
-                            if not _tm_ids:
-                                _tm_ids = [s.id for s in crud.get_tm_services(db, enabled=True)]
-                            if not _tm_ids:
-                                log_callback("[TM] 无可用 Team Manager 服务，跳过上传")
-                            for _sid in _tm_ids:
-                                try:
-                                    _svc = crud.get_tm_service_by_id(db, _sid)
-                                    if not _svc:
-                                        continue
-                                    log_callback(f"[TM] 正在把账号发往服务站: {_svc.name}")
-                                    _ok, _msg = upload_to_team_manager(saved_account, _svc.api_url, _svc.api_key)
-                                    log_callback(f"[TM] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
-                                except Exception as _e:
-                                    log_callback(f"[TM] 异常({_sid}): {_e}")
-                    except Exception as tm_err:
-                        log_callback(f"[TM] 上传异常: {tm_err}")
+                    if auto_upload_tm:
+                        try:
+                            from ...core.upload.team_manager_upload import upload_to_team_manager
+                            saved_account = _get_saved_account_by_email(db, result.email)
+                            if saved_account and saved_account.access_token:
+                                _tm_ids = tm_service_ids or []
+                                if not _tm_ids:
+                                    _tm_ids = [s.id for s in crud.get_tm_services(db, enabled=True)]
+                                if not _tm_ids:
+                                    log_callback("[TM] 无可用 Team Manager 服务，跳过上传")
+                                for _sid in _tm_ids:
+                                    try:
+                                        _svc = crud.get_tm_service_by_id(db, _sid)
+                                        if not _svc:
+                                            continue
+                                        log_callback(f"[TM] 正在把账号发往服务站: {_svc.name}")
+                                        _ok, _msg = upload_to_team_manager(saved_account, _svc.api_url, _svc.api_key)
+                                        log_callback(f"[TM] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
+                                    except Exception as _e:
+                                        log_callback(f"[TM] 异常({_sid}): {_e}")
+                        except Exception as tm_err:
+                            log_callback(f"[TM] 上传异常: {tm_err}")
 
-                if auto_upload_new_api:
-                    try:
-                        from ...core.upload.new_api_upload import upload_to_new_api
-                        from ...database.models import Account as AccountModel
-                        saved_account = db.query(AccountModel).filter_by(email=result.email).first()
-                        if saved_account and saved_account.access_token:
-                            _new_api_ids = new_api_service_ids or []
-                            if not _new_api_ids:
-                                _new_api_ids = [s.id for s in crud.get_new_api_services(db, enabled=True)]
-                            if not _new_api_ids:
-                                log_callback("[NewAPI] 无可用 new-api 服务，跳过上传")
-                            for _sid in _new_api_ids:
-                                try:
-                                    _svc = crud.get_new_api_service_by_id(db, _sid)
-                                    if not _svc:
-                                        continue
-                                    log_callback(f"[NewAPI] 正在把账号发往服务站: {_svc.name}")
-                                    _ok, _msg = upload_to_new_api(
-                                        [saved_account],
-                                        _svc.api_url,
-                                        getattr(_svc, 'username', None),
-                                        getattr(_svc, 'password', None),
-                                    )
-                                    log_callback(f"[NewAPI] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
-                                except Exception as _e:
-                                    log_callback(f"[NewAPI] 异常({_sid}): {_e}")
-                    except Exception as new_api_err:
-                        log_callback(f"[NewAPI] 上传异常: {new_api_err}")
+                    if auto_upload_new_api:
+                        try:
+                            from ...core.upload.new_api_upload import upload_to_new_api
+                            saved_account = _get_saved_account_by_email(db, result.email)
+                            if saved_account and saved_account.access_token:
+                                _new_api_ids = new_api_service_ids or []
+                                if not _new_api_ids:
+                                    _new_api_ids = [s.id for s in crud.get_new_api_services(db, enabled=True)]
+                                if not _new_api_ids:
+                                    log_callback("[NewAPI] 无可用 new-api 服务，跳过上传")
+                                for _sid in _new_api_ids:
+                                    try:
+                                        _svc = crud.get_new_api_service_by_id(db, _sid)
+                                        if not _svc:
+                                            continue
+                                        log_callback(f"[NewAPI] 正在把账号发往服务站: {_svc.name}")
+                                        _ok, _msg = upload_to_new_api(
+                                            [saved_account],
+                                            _svc.api_url,
+                                            getattr(_svc, 'username', None),
+                                            getattr(_svc, 'password', None),
+                                        )
+                                        log_callback(f"[NewAPI] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
+                                    except Exception as _e:
+                                        log_callback(f"[NewAPI] 异常({_sid}): {_e}")
+                        except Exception as new_api_err:
+                            log_callback(f"[NewAPI] 上传异常: {new_api_err}")
+                except Exception as post_process_err:
+                    logger.warning("注册成功后的附加处理失败，但不影响任务成功: task=%s err=%s", task_uuid, post_process_err)
 
                 # 更新任务状态
                 crud.update_registration_task(
@@ -862,6 +910,17 @@ def _make_batch_helpers(batch_id: str):
     return add_batch_log, update_batch_status
 
 
+async def _sleep_with_batch_cancel(batch_id: str, seconds: int) -> bool:
+    remaining = max(0, int(seconds or 0))
+    while remaining > 0:
+        if task_manager.is_batch_cancelled(batch_id) or batch_tasks.get(batch_id, {}).get("cancelled"):
+            return False
+        step = min(1, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+    return True
+
+
 async def run_batch_parallel(
     batch_id: str,
     task_uuids: List[str],
@@ -892,6 +951,10 @@ async def run_batch_parallel(
     async def _run_one(idx: int, uuid: str):
         prefix = f"[任务{idx + 1}]"
         async with semaphore:
+            if task_manager.is_batch_cancelled(batch_id) or batch_tasks.get(batch_id, {}).get("cancelled"):
+                with get_db() as db:
+                    crud.update_registration_task(db, uuid, status="cancelled", completed_at=utcnow_naive())
+                return
             await run_registration_task(
                 uuid, email_service_type, proxy, email_service_config, email_service_id,
                 log_prefix=prefix, batch_id=batch_id,
@@ -963,6 +1026,10 @@ async def run_batch_pipeline(
 
     async def _run_and_release(idx: int, uuid: str, pfx: str):
         try:
+            if task_manager.is_batch_cancelled(batch_id) or batch_tasks.get(batch_id, {}).get("cancelled"):
+                with get_db() as db:
+                    crud.update_registration_task(db, uuid, status="cancelled", completed_at=utcnow_naive())
+                return
             await run_registration_task(
                 uuid, email_service_type, proxy, email_service_config, email_service_id,
                 log_prefix=pfx, batch_id=batch_id,
@@ -1009,7 +1076,10 @@ async def run_batch_pipeline(
             if i < len(task_uuids) - 1 and not task_manager.is_batch_cancelled(batch_id):
                 wait_time = random.randint(interval_min, interval_max)
                 logger.info(f"批量任务 {batch_id}: 等待 {wait_time} 秒后启动下一个任务")
-                await asyncio.sleep(wait_time)
+                should_continue = await _sleep_with_batch_cancel(batch_id, wait_time)
+                if not should_continue:
+                    add_batch_log("[取消] 等待下一任务期间收到取消请求，停止继续投递")
+                    break
 
         if running_tasks_list:
             await asyncio.gather(*running_tasks_list, return_exceptions=True)
@@ -1341,7 +1411,7 @@ async def _start_outlook_batch_registration_internal(
 
                 config = service.config or {}
                 email = config.get("email") or service.name
-                existing_account = db.query(Account).filter(Account.email == email).first()
+                existing_account = _find_registered_account_by_email(db, email)
                 if existing_account:
                     skipped_count += 1
                 else:
@@ -1429,6 +1499,7 @@ async def dispatch_registration_config(
             tm_service_ids=config.get('tm_service_ids') or [],
             auto_upload_new_api=bool(config.get('auto_upload_new_api', False)),
             new_api_service_ids=config.get('new_api_service_ids') or [],
+            registration_type=str(config.get('registration_type') or RoleTag.CHILD.value),
         )
         response = await _start_outlook_batch_registration_internal(request, background_tasks)
         return {
@@ -1994,12 +2065,10 @@ async def get_outlook_accounts_for_registration():
 
         for service in outlook_services:
             config = service.config or {}
-            email = config.get("email") or service.name
+            email = str(config.get("email") or service.name or "").strip()
 
             # 检查是否已注册（查询 accounts 表）
-            existing_account = db.query(Account).filter(
-                Account.email == email
-            ).first()
+            existing_account = _find_registered_account_by_email(db, email)
 
             is_registered = existing_account is not None
             if is_registered:
@@ -2041,6 +2110,7 @@ async def run_outlook_batch_registration(
     tm_service_ids: List[int] = None,
     auto_upload_new_api: bool = False,
     new_api_service_ids: List[int] = None,
+    registration_type: str = RoleTag.CHILD.value,
 ):
     """
     异步执行 Outlook 批量注册任务，复用通用并发逻辑
@@ -2086,6 +2156,7 @@ async def run_outlook_batch_registration(
         tm_service_ids=tm_service_ids,
         auto_upload_new_api=auto_upload_new_api,
         new_api_service_ids=new_api_service_ids,
+        registration_type=registration_type,
     )
 
 
@@ -2320,4 +2391,3 @@ async def delete_scheduled_registration_job(job_uuid: str):
             raise HTTPException(status_code=400, detail="无法删除执行中的计划任务")
         crud.delete_scheduled_registration_job(db, job_uuid)
         return {'success': True, 'message': '计划任务已删除'}
-

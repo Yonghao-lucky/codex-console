@@ -38,6 +38,7 @@ from ...core.openai.token_refresh import refresh_account_token as do_refresh
 from ...database import crud
 from ...database.models import Account, TeamInviteRecord, EmailService as EmailServiceModel
 from ...database.session import get_db
+from ..services.accounts_service import reconcile_account_runtime_state
 from ...services import EmailServiceFactory, EmailServiceType as ServiceEmailType
 
 logger = logging.getLogger(__name__)
@@ -240,7 +241,7 @@ def _cached_verify_needs_realtime(source: str) -> bool:
         return True
     if "hard_remove_auth" in source_lower:
         return True
-    if "http_401" in source_lower or "http_403" in source_lower:
+    if "http_401" in source_lower:
         return True
     if _is_token_invalidated_error(source_lower):
         return True
@@ -787,6 +788,9 @@ def _classify_team_account_row(
     has_workspace = bool(str(item.get("workspace_id") or "").strip())
     can_auth = has_access_token or has_refresh_token or has_session_token
     role_tag = _resolve_account_role_tag(account)
+    if role_tag == RoleTag.NONE.value and has_workspace and has_access_token:
+        role_tag = _set_account_role_tag(account, RoleTag.PARENT.value)
+        row_changed += 1
     account_label = role_tag_to_account_label(role_tag)
     item["role_tag"] = role_tag
     item["account_label"] = account_label
@@ -1399,7 +1403,6 @@ def _list_team_inviter_accounts(include_frozen: bool = False, force: bool = Fals
                 if (
                     "hard_remove_auth" in source_lower
                     or "http_401" in source_lower
-                    or "http_403" in source_lower
                     or _is_token_invalidated_error(source_lower)
                 ):
                     auth_failed_ids.add(item_id)
@@ -1502,7 +1505,7 @@ def _list_team_inviter_accounts(include_frozen: bool = False, force: bool = Fals
             manager_verified, manager_source, from_realtime = verify_results[account_id]
 
         source_lower = str(manager_source or "").lower()
-        auth_failed = ("http_401" in source_lower) or ("http_403" in source_lower) or _is_token_invalidated_error(source_lower)
+        auth_failed = ("http_401" in source_lower) or _is_token_invalidated_error(source_lower)
         if (not manager_verified) and account_obj is not None and _is_auth_source_for_mail_fallback(manager_source):
             blocked_by_mail, mail_source = _scan_deactivation_mail_fallback(account_obj, force=force)
             if blocked_by_mail:
@@ -1787,6 +1790,9 @@ def _list_target_email_accounts() -> List[Dict[str, Any]]:
 
 def _find_selected_inviter(inviter_id: Optional[int]) -> Dict[str, Any]:
     candidates = _list_team_inviter_accounts()
+    if not candidates:
+        rebuild_team_pool()
+        candidates = _list_team_inviter_accounts(force=True)
     if not candidates:
         frozen_candidates = _list_team_inviter_accounts(include_frozen=True)
         if frozen_candidates:
@@ -2180,8 +2186,10 @@ def _is_verified_team_manager(
         status_code = int((meta or {}).get("status_code") or 0)
         raw_meta = str((meta or {}).get("raw") or "").strip()
         if not candidates:
-            if status_code in (401, 403):
+            if status_code == 401:
                 return False, f"workspace_candidates_http_{status_code}", True
+            if status_code == 403:
+                return False, f"workspace_candidates_http_{status_code}", False
             if status_code and status_code != 200:
                 return False, f"workspace_candidates_http_{status_code}:{raw_meta[:80]}", False
             return False, "workspace_candidates_empty", False
@@ -2213,8 +2221,10 @@ def _is_verified_team_manager(
 
         if probe_status < 400:
             return True, "invites_probe_ok", False
-        if probe_status in (401, 403):
+        if probe_status == 401:
             return False, f"invites_probe_http_{probe_status}", True
+        if probe_status == 403:
+            return False, f"invites_probe_http_{probe_status}", False
         probe_err = str(raw or "").strip()[:80]
         if probe_err:
             return False, f"invites_probe_http_{probe_status}:{probe_err}", False
@@ -2337,10 +2347,12 @@ def _compute_team_status(account_status: str, current_members: int, max_members:
     st = str(account_status or "").strip().lower()
     if st in {
         AccountStatus.FAILED.value,
-        AccountStatus.EXPIRED.value,
         AccountStatus.BANNED.value,
     }:
         return st
+    if st == AccountStatus.EXPIRED.value:
+        # Team 账号额度/订阅受限不等于不可管理，控制台展示不应退化成失败态。
+        return AccountStatus.ACTIVE.value
     if max_members > 0 and current_members >= max_members:
         return "full"
     return AccountStatus.ACTIVE.value
@@ -2394,8 +2406,8 @@ def _build_console_row_for_account(
             current_members = len(joined) + len(invited)
 
     status = _compute_team_status(str(account.status or ""), current_members, max_members)
-    plan = _normalize_plan(getattr(account, "subscription_type", None)) or "team"
-    if plan == "free":
+    plan = _normalize_plan(getattr(account, "subscription_type", None))
+    if plan == "free" and selected_workspace:
         plan = "team"
 
     return {
@@ -2755,6 +2767,19 @@ def add_inviter_pool(request: TeamInviterPoolAddRequest):
 @router.post("/pool/rebuild")
 def rebuild_team_pool():
     """手动重建 Team 池状态（用于脏状态修复）。"""
+    proxy_url = _get_proxy()
+    with get_db() as db:
+        rows = db.query(Account).all()
+        candidate_ids = [
+            int(row.id)
+            for row in rows
+            if _infer_account_plan(row) == "team" or bool(str(getattr(row, "access_token", "") or "").strip())
+        ]
+    for account_id in candidate_ids:
+        try:
+            reconcile_account_runtime_state(account_id, proxy_url=proxy_url)
+        except Exception as exc:
+            logger.warning("team池重建前状态收敛失败: account_id=%s err=%s", account_id, exc)
     grouped = _classify_team_accounts(force=True)
     inviters = _list_team_inviter_accounts(force=True)
     _invalidate_team_runtime_caches()
@@ -2943,6 +2968,11 @@ def refresh_team_account(account_id: int, proxy: Optional[str] = None):
     """
     account = _get_team_account_by_id_or_raise(account_id)
     proxy_url = _get_proxy(proxy)
+    reconcile_account_runtime_state(account.id, proxy_url=proxy_url, desired_role_tag=RoleTag.PARENT.value)
+    with get_db() as db:
+        latest = db.query(Account).filter(Account.id == account.id).first()
+        if latest:
+            account = latest
     row = _build_console_row_for_account(
         account=account,
         proxy_url=proxy_url,
@@ -3444,6 +3474,17 @@ async def execute_auto_team_invite(request: AutoTeamInviteRequest):
                     error_text="",
                     success=True,
                 )
+                try:
+                    target_account = db.query(Account).filter(func.lower(Account.email) == target_email.lower()).first()
+                    if target_account:
+                        reconcile_account_runtime_state(
+                            target_account.id,
+                            proxy_url=proxy_url,
+                            desired_role_tag=RoleTag.CHILD.value,
+                            target_email=target_email,
+                        )
+                except Exception as reconcile_err:
+                    logger.warning("邀请成功后子号状态收敛失败: email=%s err=%s", target_email, reconcile_err)
                 breaker_record_success("team_invite")
                 if proxy_url:
                     breaker_record_success("proxy_runtime")
@@ -3478,6 +3519,17 @@ async def execute_auto_team_invite(request: AutoTeamInviteRequest):
                     error_text=error_text,
                     success=True,
                 )
+                try:
+                    target_account = db.query(Account).filter(func.lower(Account.email) == target_email.lower()).first()
+                    if target_account:
+                        reconcile_account_runtime_state(
+                            target_account.id,
+                            proxy_url=proxy_url,
+                            desired_role_tag=RoleTag.CHILD.value,
+                            target_email=target_email,
+                        )
+                except Exception as reconcile_err:
+                    logger.warning("邀请幂等成功后子号状态收敛失败: email=%s err=%s", target_email, reconcile_err)
                 breaker_record_success("team_invite")
                 if proxy_url:
                     breaker_record_success("proxy_runtime")

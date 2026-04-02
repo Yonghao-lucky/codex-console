@@ -23,6 +23,52 @@ from ...database.models import Account
 logger = logging.getLogger(__name__)
 
 
+def _is_quota_limited_error(error_text: Optional[str]) -> bool:
+    text = str(error_text or "").strip().lower()
+    if not text:
+        return False
+    markers = (
+        "402",
+        "payment required",
+        "订阅受限",
+        "quota exceeded",
+        "quota exhausted",
+        "usage limit",
+        "limit reached",
+        "rate limit",
+        "hourly quota",
+        "weekly quota",
+        "allowance exhausted",
+        "5小时",
+        "五小时",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _is_network_or_transient_error(error_text: Optional[str]) -> bool:
+    text = str(error_text or "").strip().lower()
+    if not text:
+        return False
+    markers = (
+        "验证异常",
+        "timeout",
+        "timed out",
+        "network",
+        "connection",
+        "proxy",
+        "temporarily",
+        "temporary",
+        "too many requests",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "dns",
+    )
+    return any(marker in text for marker in markers)
+
+
 @dataclass
 class TokenRefreshResult:
     """Token 刷新结果"""
@@ -445,12 +491,8 @@ def validate_account_token(
         error_text = str(error or "").lower()
         if is_valid:
             next_status = AccountStatus.ACTIVE.value
-        elif (
-            "402" in error_text
-            or "payment required" in error_text
-            or "订阅受限" in error_text
-        ):
-            # 402 -> 黄色（expired）
+        elif _is_quota_limited_error(error_text):
+            # 配额/限流/订阅受限 -> 黄色（expired），不应误判为 failed。
             next_status = AccountStatus.EXPIRED.value
         elif (
             "401" in error_text
@@ -467,8 +509,12 @@ def validate_account_token(
             or "forbidden" in error_text
         ):
             next_status = AccountStatus.BANNED.value
+        elif _is_network_or_transient_error(error_text):
+            # 网络/代理/临时异常不改业务状态，保持原状态。
+            next_status = account.status or AccountStatus.ACTIVE.value
         else:
-            next_status = AccountStatus.FAILED.value
+            # 未识别错误保守处理：保持原状态，避免把“暂时不可立即使用”误打成 failed。
+            next_status = account.status or AccountStatus.ACTIVE.value
 
         if account.status != next_status:
             crud.update_account(db, account_id, status=next_status)

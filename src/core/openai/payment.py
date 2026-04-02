@@ -518,12 +518,24 @@ _COUNTRY_CURRENCY_MAP = {
 
 
 def _resolve_chatgpt_account_id(account: Account) -> Optional[str]:
-    # 优先从当前 token 解析，避免数据库里旧 account_id 导致订阅误判。
+    # Team/Workspace 场景优先使用本地收敛后的 workspace/account_id，
+    # 避免旧 token claim 里的 personal account_id 把 Team 上下文覆盖回 free。
+    extra = account.extra_data if isinstance(getattr(account, "extra_data", None), dict) else {}
+    preferred_candidates = (
+        extra.get("team_workspace_id"),
+        account.workspace_id,
+        account.account_id,
+    )
+    for candidate in preferred_candidates:
+        value = str(candidate or "").strip()
+        if value:
+            return value
+
     token_account_id = (
         _extract_chatgpt_account_id_from_jwt(account.access_token)
         or _extract_chatgpt_account_id_from_jwt(account.id_token)
     )
-    for candidate in (token_account_id, account.account_id, account.workspace_id):
+    for candidate in (token_account_id, extra.get("personal_account_id")):
         value = str(candidate or "").strip()
         if value:
             return value

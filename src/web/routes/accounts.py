@@ -9,6 +9,7 @@ import re
 import threading
 import zipfile
 import base64
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -23,6 +24,7 @@ from ...config.settings import get_settings
 from ...core.openai.overview import fetch_codex_overview, AccountDeactivatedError
 from ...core.openai.token_refresh import refresh_account_token as do_refresh
 from ...core.openai.token_refresh import validate_account_token as do_validate
+from ...core.openai.token_refresh import _is_network_or_transient_error, _is_quota_limited_error
 from ...core.upload.cpa_upload import generate_token_json, batch_upload_to_cpa, upload_to_cpa
 from ...core.upload.team_manager_upload import upload_to_team_manager, batch_upload_to_team_manager
 from ...core.upload.sub2api_upload import batch_upload_to_sub2api, upload_to_sub2api
@@ -33,6 +35,8 @@ from ...core.timezone_utils import utcnow_naive
 from ...database import crud
 from ...database.models import Account
 from ...database.session import get_db
+from ..repositories.account_repository import query_role_tag_counts
+from ..services.accounts_service import reconcile_account_runtime_state
 from ..task_manager import task_manager
 
 logger = logging.getLogger(__name__)
@@ -149,6 +153,12 @@ class AccountResponse(BaseModel):
     proxy_used: Optional[str] = None
     cpa_uploaded: bool = False
     cpa_uploaded_at: Optional[str] = None
+    account_label: Optional[str] = None
+    role_tag: Optional[str] = None
+    biz_tag: Optional[str] = None
+    pool_state: Optional[str] = None
+    pool_state_manual: Optional[str] = None
+    priority: int = 50
     subscription_type: Optional[str] = None
     subscription_at: Optional[str] = None
     cookies: Optional[str] = None
@@ -170,6 +180,12 @@ class AccountUpdateRequest(BaseModel):
     metadata: Optional[dict] = None
     cookies: Optional[str] = None  # 完整 cookie 字符串，用于支付请求
     session_token: Optional[str] = None
+    role_tag: Optional[str] = None
+    account_label: Optional[str] = None
+    biz_tag: Optional[str] = None
+    pool_state: Optional[str] = None
+    pool_state_manual: Optional[str] = None
+    priority: Optional[int] = None
 
 
 class ManualAccountCreateRequest(BaseModel):
@@ -209,6 +225,11 @@ class AccountImportItem(BaseModel):
     proxy_used: Optional[str] = None
     source: Optional[str] = "import"
     subscription_type: Optional[str] = None
+    role_tag: Optional[str] = None
+    account_label: Optional[str] = None
+    biz_tag: Optional[str] = None
+    pool_state: Optional[str] = None
+    priority: Optional[int] = None
     plan_type: Optional[str] = None
     auth_mode: Optional[str] = None
     user_id: Optional[str] = None
@@ -235,6 +256,7 @@ class BatchDeleteRequest(BaseModel):
     select_all: bool = False
     status_filter: Optional[str] = None
     email_service_filter: Optional[str] = None
+    role_tag_filter: Optional[str] = None
     search_filter: Optional[str] = None
 
 
@@ -251,6 +273,7 @@ class OverviewRefreshRequest(BaseModel):
     select_all: bool = False
     status_filter: Optional[str] = None
     email_service_filter: Optional[str] = None
+    role_tag_filter: Optional[str] = None
     search_filter: Optional[str] = None
     proxy: Optional[str] = None
 
@@ -261,6 +284,7 @@ class OverviewCardDeleteRequest(BaseModel):
     select_all: bool = False
     status_filter: Optional[str] = None
     email_service_filter: Optional[str] = None
+    role_tag_filter: Optional[str] = None
     search_filter: Optional[str] = None
 
 
@@ -272,6 +296,7 @@ def resolve_account_ids(
     select_all: bool = False,
     status_filter: Optional[str] = None,
     email_service_filter: Optional[str] = None,
+    role_tag_filter: Optional[str] = None,
     search_filter: Optional[str] = None,
 ) -> List[int]:
     """当 select_all=True 时查询全部符合条件的 ID，否则直接返回传入的 ids"""
@@ -282,6 +307,10 @@ def resolve_account_ids(
         query = _apply_status_filter(query, status_filter)
     if email_service_filter:
         query = query.filter(Account.email_service == email_service_filter)
+    if role_tag_filter:
+        normalized_role = str(role_tag_filter or "").strip().lower()
+        if normalized_role in {"parent", "child", "none"}:
+            query = query.filter(func.lower(func.coalesce(Account.role_tag, "none")) == normalized_role)
     if search_filter:
         pattern = f"%{search_filter}%"
         query = query.filter(
@@ -308,6 +337,12 @@ def account_to_response(account: Account) -> AccountResponse:
         proxy_used=account.proxy_used,
         cpa_uploaded=account.cpa_uploaded or False,
         cpa_uploaded_at=account.cpa_uploaded_at.isoformat() if account.cpa_uploaded_at else None,
+        account_label=account.account_label,
+        role_tag=account.role_tag,
+        biz_tag=account.biz_tag,
+        pool_state=account.pool_state,
+        pool_state_manual=account.pool_state_manual,
+        priority=int(getattr(account, "priority", 50) or 50),
         subscription_type=account.subscription_type,
         subscription_at=account.subscription_at.isoformat() if account.subscription_at else None,
         cookies=account.cookies,
@@ -845,6 +880,11 @@ async def import_accounts(request: ImportAccountsRequest):
                 ))
             )
             metadata = dict(item.metadata) if isinstance(item.metadata, dict) else {}
+            role_tag = str(item.role_tag or "").strip().lower() or None
+            account_label = str(item.account_label or "").strip().lower() or None
+            biz_tag = str(item.biz_tag or "").strip() or None
+            pool_state = str(item.pool_state or "").strip() or None
+            priority = int(item.priority) if item.priority is not None else None
             for extra_key in (
                 "id",
                 "auth_mode",
@@ -888,6 +928,11 @@ async def import_accounts(request: ImportAccountsRequest):
                         "source": source,
                         "extra_data": metadata,
                         "last_refresh": utcnow_naive(),
+                        "role_tag": role_tag,
+                        "account_label": account_label,
+                        "biz_tag": biz_tag,
+                        "pool_state": pool_state,
+                        "priority": priority,
                     }
                     clean_update_payload = {k: v for k, v in update_payload.items() if v is not None}
                     account = crud.update_account(db, exists.id, **clean_update_payload)
@@ -916,6 +961,11 @@ async def import_accounts(request: ImportAccountsRequest):
                     extra_data=metadata,
                     status=status,
                     source=source,
+                    role_tag=role_tag,
+                    account_label=account_label,
+                    biz_tag=biz_tag,
+                    pool_state=pool_state,
+                    priority=priority if priority is not None else 50,
                 )
                 if subscription_type:
                     account.subscription_type = subscription_type
@@ -935,6 +985,7 @@ async def list_accounts(
     page_size: int = Query(20, ge=1, le=100, description="每页数量"),
     status: Optional[str] = Query(None, description="状态筛选"),
     email_service: Optional[str] = Query(None, description="邮箱服务筛选"),
+    role_tag: Optional[str] = Query(None, description="标号筛选"),
     search: Optional[str] = Query(None, description="搜索关键词"),
 ):
     """
@@ -953,6 +1004,11 @@ async def list_accounts(
         # 邮箱服务筛选
         if email_service:
             query = query.filter(Account.email_service == email_service)
+
+        if role_tag:
+            normalized_role = str(role_tag or "").strip().lower()
+            if normalized_role in {"parent", "child", "none"}:
+                query = query.filter(func.lower(func.coalesce(Account.role_tag, "none")) == normalized_role)
 
         # 搜索
         if search:
@@ -1439,9 +1495,9 @@ async def update_account(account_id: int, request: AccountUpdateRequest):
             update_data["status"] = request.status
 
         if request.metadata:
-            current_metadata = account.metadata or {}
+            current_metadata = account.extra_data if isinstance(account.extra_data, dict) else {}
             current_metadata.update(request.metadata)
-            update_data["metadata"] = current_metadata
+            update_data["extra_data"] = current_metadata
 
         if request.cookies is not None:
             # 留空则清空，非空则更新
@@ -1451,6 +1507,24 @@ async def update_account(account_id: int, request: AccountUpdateRequest):
             # 留空则清空，非空则更新
             update_data["session_token"] = request.session_token or None
             update_data["last_refresh"] = utcnow_naive()
+
+        if request.role_tag is not None:
+            update_data["role_tag"] = request.role_tag
+
+        if request.account_label is not None:
+            update_data["account_label"] = request.account_label
+
+        if request.biz_tag is not None:
+            update_data["biz_tag"] = request.biz_tag
+
+        if request.pool_state is not None:
+            update_data["pool_state"] = request.pool_state
+
+        if request.pool_state_manual is not None:
+            update_data["pool_state_manual"] = request.pool_state_manual
+
+        if request.priority is not None:
+            update_data["priority"] = request.priority
 
         account = crud.update_account(db, account_id, **update_data)
         return account_to_response(account)
@@ -1484,7 +1558,7 @@ async def batch_delete_accounts(request: BatchDeleteRequest):
     with get_db() as db:
         ids = resolve_account_ids(
             db, request.ids, request.select_all,
-            request.status_filter, request.email_service_filter, request.search_filter
+            request.status_filter, request.email_service_filter, request.role_tag_filter, request.search_filter
         )
         deleted_count = 0
         errors = []
@@ -1537,6 +1611,7 @@ class BatchExportRequest(BaseModel):
     select_all: bool = False
     status_filter: Optional[str] = None
     email_service_filter: Optional[str] = None
+    role_tag_filter: Optional[str] = None
     search_filter: Optional[str] = None
 
 
@@ -1546,7 +1621,7 @@ async def export_accounts_json(request: BatchExportRequest):
     with get_db() as db:
         ids = resolve_account_ids(
             db, request.ids, request.select_all,
-            request.status_filter, request.email_service_filter, request.search_filter
+            request.status_filter, request.email_service_filter, request.role_tag_filter, request.search_filter
         )
         accounts = db.query(Account).filter(Account.id.in_(ids)).all()
 
@@ -1592,7 +1667,7 @@ async def export_accounts_csv(request: BatchExportRequest):
     with get_db() as db:
         ids = resolve_account_ids(
             db, request.ids, request.select_all,
-            request.status_filter, request.email_service_filter, request.search_filter
+            request.status_filter, request.email_service_filter, request.role_tag_filter, request.search_filter
         )
         accounts = db.query(Account).filter(Account.id.in_(ids)).all()
 
@@ -1680,7 +1755,7 @@ async def export_accounts_sub2api(request: BatchExportRequest):
     with get_db() as db:
         ids = resolve_account_ids(
             db, request.ids, request.select_all,
-            request.status_filter, request.email_service_filter, request.search_filter
+            request.status_filter, request.email_service_filter, request.role_tag_filter, request.search_filter
         )
         accounts = db.query(Account).filter(Account.id.in_(ids)).all()
 
@@ -1709,7 +1784,7 @@ async def export_accounts_codex(request: BatchExportRequest):
     with get_db() as db:
         ids = resolve_account_ids(
             db, request.ids, request.select_all,
-            request.status_filter, request.email_service_filter, request.search_filter
+            request.status_filter, request.email_service_filter, request.role_tag_filter, request.search_filter
         )
         accounts = db.query(Account).filter(Account.id.in_(ids)).all()
 
@@ -1745,7 +1820,7 @@ async def export_accounts_cpa(request: BatchExportRequest):
     with get_db() as db:
         ids = resolve_account_ids(
             db, request.ids, request.select_all,
-            request.status_filter, request.email_service_filter, request.search_filter
+            request.status_filter, request.email_service_filter, request.role_tag_filter, request.search_filter
         )
         accounts = db.query(Account).filter(Account.id.in_(ids)).all()
 
@@ -1856,6 +1931,7 @@ async def get_accounts_overview():
         return {
             "total": total,
             "active_count": active_count,
+            "tagged_role_counts": query_role_tag_counts(db),
             "token_stats": {
                 "with_access_token": with_access_token,
                 "with_refresh_token": with_refresh_token,
@@ -1898,6 +1974,7 @@ class BatchRefreshRequest(BaseModel):
     select_all: bool = False
     status_filter: Optional[str] = None
     email_service_filter: Optional[str] = None
+    role_tag_filter: Optional[str] = None
     search_filter: Optional[str] = None
 
 
@@ -1913,6 +1990,7 @@ class BatchValidateRequest(BaseModel):
     select_all: bool = False
     status_filter: Optional[str] = None
     email_service_filter: Optional[str] = None
+    role_tag_filter: Optional[str] = None
     search_filter: Optional[str] = None
 
 
@@ -1930,20 +2008,21 @@ async def batch_refresh_tokens(request: BatchRefreshRequest, background_tasks: B
     with get_db() as db:
         ids = resolve_account_ids(
             db, request.ids, request.select_all,
-            request.status_filter, request.email_service_filter, request.search_filter
+            request.status_filter, request.email_service_filter, request.role_tag_filter, request.search_filter
         )
 
     for account_id in ids:
         try:
             result = do_refresh(account_id, proxy)
+            reconcile_result = reconcile_account_runtime_state(account_id, proxy_url=proxy)
             if result.success:
                 results["success_count"] += 1
             else:
                 results["failed_count"] += 1
-                results["errors"].append({"id": account_id, "error": result.error_message})
+                results["errors"].append({"id": account_id, "error": result.error_message, "reconciled": reconcile_result, "recovered_by_relogin": False})
         except Exception as e:
             results["failed_count"] += 1
-            results["errors"].append({"id": account_id, "error": str(e)})
+            results["errors"].append({"id": account_id, "error": str(e), "recovered_by_relogin": False})
 
     return results
 
@@ -1954,16 +2033,20 @@ async def refresh_account_token(account_id: int, request: Optional[TokenRefreshR
     proxy = _get_proxy(request.proxy if request else None)
     result = do_refresh(account_id, proxy)
 
+    reconcile_result = reconcile_account_runtime_state(account_id, proxy_url=proxy)
+
     if result.success:
         return {
             "success": True,
             "message": "Token 刷新成功",
-            "expires_at": result.expires_at.isoformat() if result.expires_at else None
+            "expires_at": result.expires_at.isoformat() if result.expires_at else None,
+            "reconciled": reconcile_result,
         }
     else:
         return {
             "success": False,
-            "error": result.error_message
+            "error": result.error_message,
+            "reconciled": reconcile_result,
         }
 
 
@@ -1980,7 +2063,7 @@ def _run_batch_validate_tokens(request: BatchValidateRequest) -> Dict[str, Any]:
     with get_db() as db:
         ids = resolve_account_ids(
             db, request.ids, request.select_all,
-            request.status_filter, request.email_service_filter, request.search_filter
+            request.status_filter, request.email_service_filter, request.role_tag_filter, request.search_filter
         )
 
     for account_id in ids:
@@ -1996,12 +2079,32 @@ def _run_batch_validate_tokens(request: BatchValidateRequest) -> Dict[str, Any]:
             else:
                 results["invalid_count"] += 1
         except Exception as e:
-            # 异常账号兜底打标 failed，保证前端“失败”筛选可见。
+            # 异常兜底不要一律打 failed。
+            # - 配额/限流 -> expired
+            # - 网络/代理/临时异常 -> 保持原状态
+            # - 明确 token 无效 -> failed
+            error_text = str(e or "")
             try:
                 with get_db() as db:
                     account = crud.get_account_by_id(db, account_id)
-                    if account and account.status != AccountStatus.FAILED.value:
-                        crud.update_account(db, account_id, status=AccountStatus.FAILED.value)
+                    if account:
+                        error_lower = error_text.lower()
+                        next_status = None
+                        if _is_quota_limited_error(error_lower):
+                            next_status = AccountStatus.EXPIRED.value
+                        elif (
+                            "401" in error_lower
+                            or "invalid" in error_lower
+                            or "unauthorized" in error_lower
+                            or "expired" in error_lower
+                            or "过期" in error_lower
+                        ):
+                            next_status = AccountStatus.FAILED.value
+                        elif _is_network_or_transient_error(error_lower):
+                            next_status = account.status
+
+                        if next_status and account.status != next_status:
+                            crud.update_account(db, account_id, status=next_status)
             except Exception:
                 pass
             results["invalid_count"] += 1
@@ -2014,10 +2117,143 @@ def _run_batch_validate_tokens(request: BatchValidateRequest) -> Dict[str, Any]:
     return results
 
 
+def _run_accounts_domain_task(task_id: str, task_type: str, runner, request_obj, total: int) -> None:
+    domain = "accounts"
+    acquired = False
+    try:
+        import time
+
+        while True:
+            if task_manager.is_domain_task_cancel_requested(domain, task_id):
+                task_manager.update_domain_task(
+                    domain,
+                    task_id,
+                    status="cancelled",
+                    message="任务已取消",
+                    finished_at=utcnow_naive().isoformat(),
+                )
+                return
+            acquired, running, quota = task_manager.try_acquire_domain_slot(domain, task_id)
+            if acquired:
+                break
+            task_manager.update_domain_task(
+                domain,
+                task_id,
+                status="pending",
+                message=f"等待可用执行槽位 ({running}/{quota})",
+            )
+            time.sleep(0.5)
+
+        task_manager.update_domain_task(
+            domain,
+            task_id,
+            status="running",
+            message="任务执行中",
+            progress={"completed": 0, "total": int(total or 0)},
+        )
+        result = runner(request_obj)
+        completed = int(
+            (result.get("valid_count") or 0)
+            + (result.get("invalid_count") or 0)
+            + (result.get("success_count") or 0)
+            + (result.get("failed_count") or 0)
+        )
+        task_manager.update_domain_task(
+            domain,
+            task_id,
+            status="completed",
+            message="任务执行完成",
+            finished_at=utcnow_naive().isoformat(),
+            progress={"completed": completed or int(total or 0), "total": int(total or completed or 0)},
+            result=result,
+        )
+    except Exception as exc:
+        task_manager.update_domain_task(
+            domain,
+            task_id,
+            status="failed",
+            message=str(exc),
+            finished_at=utcnow_naive().isoformat(),
+            error=str(exc),
+        )
+    finally:
+        if acquired:
+            task_manager.release_domain_slot(domain, task_id)
+
+
 @router.post("/batch-validate")
 async def batch_validate_tokens(request: BatchValidateRequest):
     """批量验证账号 Token 有效性"""
     return _run_batch_validate_tokens(request)
+
+
+@router.post("/batch-refresh/async")
+async def batch_refresh_tokens_async(request: BatchRefreshRequest, background_tasks: BackgroundTasks):
+    total = len(request.ids or []) if not request.select_all else max(1, len(request.ids or []))
+    task_id = str(uuid.uuid4())
+    task = task_manager.register_domain_task(
+        domain="accounts",
+        task_id=task_id,
+        task_type="batch_refresh",
+        payload={"select_all": bool(request.select_all)},
+        progress={"completed": 0, "total": int(total or 0)},
+    )
+    background_tasks.add_task(_run_accounts_domain_task, task_id, "batch_refresh", batch_refresh_tokens, request, total)
+    return task
+
+
+@router.post("/batch-validate/async")
+async def batch_validate_tokens_async(request: BatchValidateRequest, background_tasks: BackgroundTasks):
+    total = len(request.ids or []) if not request.select_all else max(1, len(request.ids or []))
+    task_id = str(uuid.uuid4())
+    task = task_manager.register_domain_task(
+        domain="accounts",
+        task_id=task_id,
+        task_type="batch_validate",
+        payload={"select_all": bool(request.select_all)},
+        progress={"completed": 0, "total": int(total or 0)},
+    )
+    background_tasks.add_task(_run_accounts_domain_task, task_id, "batch_validate", _run_batch_validate_tokens, request, total)
+    return task
+
+
+@router.get("/tasks/{task_id}")
+def get_account_async_task(task_id: str):
+    task = task_manager.get_domain_task("accounts", task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return task
+
+
+@router.post("/tasks/{task_id}/cancel")
+def cancel_account_async_task(task_id: str):
+    snapshot = task_manager.request_domain_task_cancel("accounts", task_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"success": True, "task": snapshot}
+
+
+@router.post("/tasks/{task_id}/pause")
+def pause_account_async_task(task_id: str):
+    snapshot = task_manager.request_domain_task_pause("accounts", task_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"success": True, "task": snapshot}
+
+
+@router.post("/tasks/{task_id}/resume")
+def resume_account_async_task(task_id: str):
+    snapshot = task_manager.request_domain_task_resume("accounts", task_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"success": True, "task": snapshot}
+
+
+def retry_account_async_task(task_id: str):
+    snapshot = task_manager.request_domain_task_retry("accounts", task_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return snapshot
 
 
 def run_quick_refresh_workflow(source: str = "manual") -> Dict[str, Any]:
@@ -2112,6 +2348,7 @@ class BatchCPAUploadRequest(BaseModel):
     select_all: bool = False
     status_filter: Optional[str] = None
     email_service_filter: Optional[str] = None
+    role_tag_filter: Optional[str] = None
     search_filter: Optional[str] = None
     cpa_service_id: Optional[int] = None  # 指定 CPA 服务 ID，不传则使用全局配置
 
@@ -2136,7 +2373,7 @@ async def batch_upload_accounts_to_cpa(request: BatchCPAUploadRequest):
     with get_db() as db:
         ids = resolve_account_ids(
             db, request.ids, request.select_all,
-            request.status_filter, request.email_service_filter, request.search_filter
+            request.status_filter, request.email_service_filter, request.role_tag_filter, request.search_filter
         )
 
     results = batch_upload_to_cpa(ids, proxy, api_url=cpa_api_url, api_token=cpa_api_token)
@@ -2165,6 +2402,9 @@ async def upload_account_to_cpa(account_id: int, request: Optional[CPAUploadRequ
         account = crud.get_account_by_id(db, account_id)
         if not account:
             raise HTTPException(status_code=404, detail="账号不存在")
+
+        reconcile_account_runtime_state(account.id, proxy_url=proxy)
+        db.refresh(account)
 
         if not account.access_token:
             return {
@@ -2200,6 +2440,7 @@ class BatchSub2ApiUploadRequest(BaseModel):
     select_all: bool = False
     status_filter: Optional[str] = None
     email_service_filter: Optional[str] = None
+    role_tag_filter: Optional[str] = None
     search_filter: Optional[str] = None
     service_id: Optional[int] = None  # 指定 Sub2API 服务 ID，不传则使用第一个启用的
     concurrency: int = 3
@@ -2275,6 +2516,8 @@ async def upload_account_to_sub2api(account_id: int, request: Optional[Sub2ApiUp
         account = crud.get_account_by_id(db, account_id)
         if not account:
             raise HTTPException(status_code=404, detail="账号不存在")
+        reconcile_account_runtime_state(account.id)
+        db.refresh(account)
         if not account.access_token:
             return {"success": False, "error": "账号缺少 Token，无法上传"}
 
@@ -2300,6 +2543,7 @@ class BatchNewApiUploadRequest(BaseModel):
     select_all: bool = False
     status_filter: Optional[str] = None
     email_service_filter: Optional[str] = None
+    role_tag_filter: Optional[str] = None
     search_filter: Optional[str] = None
     service_id: Optional[int] = None
 
@@ -2348,6 +2592,8 @@ async def upload_account_to_new_api(account_id: int, request: Optional[NewApiUpl
         account = crud.get_account_by_id(db, account_id)
         if not account:
             raise HTTPException(status_code=404, detail="账号不存在")
+        reconcile_account_runtime_state(account.id)
+        db.refresh(account)
         if not account.access_token:
             return {"success": False, "error": "账号缺少 Token，无法上传"}
 
@@ -2371,6 +2617,7 @@ class BatchUploadTMRequest(BaseModel):
     select_all: bool = False
     status_filter: Optional[str] = None
     email_service_filter: Optional[str] = None
+    role_tag_filter: Optional[str] = None
     search_filter: Optional[str] = None
     service_id: Optional[int] = None
 
@@ -2423,6 +2670,8 @@ async def upload_account_to_tm(account_id: int, request: Optional[UploadTMReques
         account = crud.get_account_by_id(db, account_id)
         if not account:
             raise HTTPException(status_code=404, detail="账号不存在")
+        reconcile_account_runtime_state(account.id)
+        db.refresh(account)
         success, message = upload_to_team_manager(account, api_url, api_key)
 
     return {"success": success, "message": message}

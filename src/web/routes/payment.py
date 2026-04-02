@@ -926,14 +926,32 @@ def _bootstrap_session_token_by_relogin(db, account: Account, proxy: Optional[st
         if login_start.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
             password_result = engine._submit_login_password()
             if not password_result.success or not password_result.is_existing_account:
-                logger.warning(
-                    "会话补全登录密码阶段失败: account_id=%s email=%s page_type=%s err=%s",
+                logger.info(
+                    "会话补全登录密码失败，回退到 OTP 验证码登录: account_id=%s email=%s err=%s",
                     account.id,
                     account.email,
-                    password_result.page_type,
                     password_result.error_message,
                 )
-                return ""
+                # 密码失败后重新走一次 OAuth，直接走 OTP 验证码（不提交密码）
+                try:
+                    did2, sen2 = engine._prepare_authorize_flow("会话补全登录(OTP回退)")
+                    if not did2:
+                        logger.warning("会话补全登录 OTP 回退: prepare_authorize_flow 失败: account_id=%s", account.id)
+                        return ""
+                    login_start2 = engine._submit_login_start(did2, sen2)
+                    if not login_start2.success:
+                        logger.warning("会话补全登录 OTP 回退: login_start 失败: account_id=%s err=%s", account.id, login_start2.error_message)
+                        return ""
+                    # 不管返回什么页面类型，都直接发送 OTP 验证码
+                    engine._log("OTP 回退: 直接请求发送验证码，跳过密码...")
+                    engine._send_verification_code(referer="https://auth.openai.com/log-in/password")
+                    # 继续走下面的 OTP 验证流程
+                except Exception as otp_fallback_exc:
+                    logger.warning(
+                        "会话补全登录 OTP 回退异常: account_id=%s email=%s err=%s",
+                        account.id, account.email, otp_fallback_exc,
+                    )
+                    return ""
         elif login_start.page_type != OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
             logger.warning(
                 "会话补全登录入口返回未知页面: account_id=%s email=%s page_type=%s",
